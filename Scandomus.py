@@ -82,6 +82,14 @@ def parse_tshark_interface_line(interface_line):
 
 
 def get_friendly_interface_name(interface_name, interface_description=''):
+    if interface_description:
+        desc = interface_description.strip()
+        paren_match = re.search(r'\(([^()]+)\)', desc)
+        if paren_match:
+            extracted_name = paren_match.group(1).strip()
+            if extracted_name:
+                return extracted_name
+
     combined = f"{interface_name} {interface_description}".lower()
 
     if 'wi-fi' in combined or 'wifi' in combined or 'wireless' in combined or 'wlan' in combined:
@@ -169,6 +177,16 @@ def get_available_interfaces():
     try:
         tshark_interfaces = get_tshark_interfaces()
         if tshark_interfaces:
+            filtered_interfaces = []
+            for interface_name in tshark_interfaces:
+                lower_interface = interface_name.lower()
+                if 'loopback' in lower_interface or 'etwdump' in lower_interface:
+                    continue
+                filtered_interfaces.append(interface_name)
+
+            if filtered_interfaces:
+                return filtered_interfaces
+
             return tshark_interfaces
 
         if sys.platform == 'win32':
@@ -682,11 +700,71 @@ def get_capture_interface_candidates(interface, interface_label=None):
 
     return candidates
 
+
+def _capture_with_tshark_cli(interface_candidate, timeout):
+    if not TSHARK_PATH:
+        raise RuntimeError('tshark não encontrado')
+
+    command = [
+        TSHARK_PATH,
+        '-i', interface_candidate,
+        '-a', f'duration:{max(1, int(timeout))}',
+        '-T', 'fields',
+        '-E', 'separator=\t',
+        '-E', 'quote=n',
+        '-E', 'occurrence=f',
+        '-e', 'frame.time_epoch',
+        '-e', 'ip.src',
+        '-e', 'ipv6.src',
+        '-e', 'eth.src',
+        '-e', 'ip.dst',
+        '-e', 'ipv6.dst',
+        '-e', 'eth.dst',
+        '-e', '_ws.col.Protocol'
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=max(3, int(timeout) + 8),
+        encoding='utf-8',
+        errors='ignore'
+    )
+
+    if result.returncode not in (0, 1):
+        stderr_msg = (result.stderr or '').strip()
+        raise RuntimeError(stderr_msg if stderr_msg else f'tshark retornou código {result.returncode}')
+
+    packets = []
+    total_seen = 0
+    for line in (result.stdout or '').splitlines():
+        if not line.strip():
+            continue
+
+        total_seen += 1
+        fields = line.split('\t')
+        while len(fields) < 8:
+            fields.append('')
+
+        _, ip_src, ipv6_src, eth_src, ip_dst, ipv6_dst, eth_dst, proto = fields[:8]
+
+        src = ip_src or ipv6_src or eth_src or 'Unknown'
+        dst = ip_dst or ipv6_dst or eth_dst or 'Unknown'
+        protocol = proto or 'Unknown'
+
+        packets.append({
+            'timestamp': datetime.now(),
+            'src': src,
+            'dst': dst,
+            'proto': protocol
+        })
+
+    return packets, total_seen
+
 def capture_traffic(interface, timeout=10, interface_label=None):
     """Capturar tráfego de rede com timeout e tratamento de erros"""
     packets = []
-    packet_count = 0
-    total_seen = 0
     errors = []
     
     try:
@@ -698,67 +776,14 @@ def capture_traffic(interface, timeout=10, interface_label=None):
             st.info(f"Tentando interfaces de captura (fallback automático): {', '.join(candidate_interfaces[:4])}")
 
         for interface_candidate in candidate_interfaces:
-            cap = None
-            loop = None
             try:
-                loop = _create_capture_event_loop()
-                asyncio.set_event_loop(loop)
-
-                capture_kwargs = {
-                    'interface': interface_candidate,
-                    'eventloop': loop
-                }
-                if TSHARK_PATH:
-                    capture_kwargs['tshark_path'] = TSHARK_PATH
-
-                cap = pyshark.LiveCapture(**capture_kwargs)
-                cap.sniff(timeout=timeout)
-
-                for pkt in cap:
-                    total_seen += 1
-                    try:
-                        if hasattr(pkt, 'ip'):
-                            src = pkt.ip.src
-                            dst = pkt.ip.dst
-                            proto = pkt.transport_layer if hasattr(pkt, 'transport_layer') else 'IP'
-                        elif hasattr(pkt, 'ipv6'):
-                            src = pkt.ipv6.src
-                            dst = pkt.ipv6.dst
-                            proto = pkt.transport_layer if hasattr(pkt, 'transport_layer') else 'IPv6'
-                        elif hasattr(pkt, 'eth'):
-                            src = pkt.eth.src
-                            dst = pkt.eth.dst
-                            proto = pkt.highest_layer if hasattr(pkt, 'highest_layer') else 'ETH'
-                        else:
-                            src = 'Unknown'
-                            dst = 'Unknown'
-                            proto = pkt.highest_layer if hasattr(pkt, 'highest_layer') else 'Unknown'
-
-                        packets.append({'timestamp': datetime.now(), 'src': src, 'dst': dst, 'proto': proto})
-                        packet_count += 1
-                    except Exception:
-                        continue
-
-                st.success(f"Captura concluída! {packet_count} pacotes processados ({total_seen} observados).")
+                captured_packets, total_seen = _capture_with_tshark_cli(interface_candidate, timeout)
+                packets = captured_packets
+                st.success(f"Captura concluída! {len(packets)} pacotes processados ({total_seen} observados).")
                 return packets
             except Exception as candidate_error:
                 candidate_error_msg = str(candidate_error) if str(candidate_error) else type(candidate_error).__name__
                 errors.append(f"{interface_candidate}: {candidate_error_msg}")
-            finally:
-                try:
-                    if cap is not None:
-                        cap.close()
-                except Exception:
-                    pass
-                try:
-                    asyncio.set_event_loop(None)
-                except Exception:
-                    pass
-                try:
-                    if loop is not None and not loop.is_closed():
-                        loop.close()
-                except Exception:
-                    pass
 
         st.error("Falha ao capturar pacotes em todas as interfaces candidatas.")
         if errors:
