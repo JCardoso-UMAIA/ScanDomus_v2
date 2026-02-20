@@ -809,8 +809,40 @@ def analyze_traffic(packets, devices=None):
     df = df[df['src'] != 'Unknown']
     if df.empty:
         return pd.DataFrame(), {}
+
+    known_names = {}
+    if devices:
+        for device in devices:
+            device_name = device.get('name', 'Unknown')
+            if not device_name or device_name == 'Unknown':
+                continue
+
+            device_ip = device.get('ip')
+            if device_ip and device_ip != 'Unknown':
+                known_names[device_ip] = device_name
+
+            device_mac = device.get('mac')
+            if device_mac and device_mac != 'Unknown':
+                known_names[device_mac.lower()] = device_name
+
+    def source_label(source_value):
+        if not isinstance(source_value, str):
+            return str(source_value)
+
+        direct_match = known_names.get(source_value)
+        if direct_match:
+            return direct_match
+
+        lower_match = known_names.get(source_value.lower())
+        if lower_match:
+            return lower_match
+
+        return source_value
+
     # Agrupar por IP de origem e contar pacotes
     traffic_by_ip = df.groupby('src').size().reset_index(name='packets')
+    traffic_by_ip['source'] = traffic_by_ip['src'].apply(source_label)
+
     # Detetar IPs suspeitas (ex: muitas ligações para fora)
     suspicious = {}
     for ip in traffic_by_ip['src']:
@@ -907,10 +939,15 @@ elif st.session_state.last_capture_at:
 if st.session_state.last_capture_at:
     st.subheader("Tráfego por Dispositivo")
     if not st.session_state.traffic_by_ip.empty:
-        fig, ax = plt.subplots()
-        ax.bar(st.session_state.traffic_by_ip['src'], st.session_state.traffic_by_ip['packets'])
-        ax.set_ylabel("Número de Pacotes")
-        ax.set_xlabel("IP de Origem")
+        traffic_plot_df = st.session_state.traffic_by_ip.sort_values('packets', ascending=False)
+        fig_height = max(4, min(14, len(traffic_plot_df) * 0.35))
+        fig, ax = plt.subplots(figsize=(12, fig_height))
+        chart_labels = traffic_plot_df['source'] if 'source' in traffic_plot_df.columns else traffic_plot_df['src']
+        ax.barh(chart_labels.astype(str), traffic_plot_df['packets'])
+        ax.invert_yaxis()
+        ax.set_xlabel("Número de Pacotes")
+        ax.set_ylabel("Dispositivo de Origem")
+        fig.tight_layout()
         st.pyplot(fig)
     else:
         st.info("Nenhum tráfego capturado para exibir.")
