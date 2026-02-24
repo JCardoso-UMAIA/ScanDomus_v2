@@ -12,12 +12,163 @@ import ctypes
 import shutil
 import socket
 import re
+import ipaddress
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 
 # --- Configurações ---
 NETWORK_RANGE = '192.168.1.0/24'  # Ajusta conforme a tua rede
+
+# --- Ranges de IPs suspeitos conhecidos ---
+# Fontes: Spamhaus, abuse.ch, listas públicas de C2, Tor exit nodes, bulletproof hosting
+SUSPICIOUS_IP_RANGES = [
+    # Spamhaus DROP list (ranges frequentemente usados para spam/malware)
+    ipaddress.ip_network('185.220.0.0/14'),    # Tor exit nodes / abuse
+    ipaddress.ip_network('185.220.100.0/22'),  # Tor exit nodes
+    ipaddress.ip_network('45.142.212.0/24'),   # Bulletproof hosting
+    ipaddress.ip_network('45.153.160.0/22'),   # Known malicious hosting
+    ipaddress.ip_network('194.165.16.0/22'),   # Abuse reports
+    ipaddress.ip_network('2.56.57.0/24'),      # Malware C2
+    ipaddress.ip_network('5.188.206.0/24'),    # Spam/botnet
+    ipaddress.ip_network('91.108.4.0/22'),     # Telegram (legítimo mas frequente em C2)
+    ipaddress.ip_network('185.234.218.0/24'),  # Bulletproof hosting
+    ipaddress.ip_network('193.32.127.0/24'),   # Abuse hosting
+    ipaddress.ip_network('194.40.243.0/24'),   # Malicious actors
+    ipaddress.ip_network('45.227.254.0/24'),   # Known C2
+    ipaddress.ip_network('179.43.128.0/21'),   # Bulletproof hosting
+    ipaddress.ip_network('80.82.77.0/24'),     # Shodan scanners / probing
+    ipaddress.ip_network('198.20.69.0/24'),    # Shodan scanners
+    ipaddress.ip_network('66.240.192.0/19'),   # Censys scanners
+    ipaddress.ip_network('162.142.125.0/24'),  # Censys scanners
+    ipaddress.ip_network('167.94.138.0/24'),   # GreyNoise scanners
+    ipaddress.ip_network('167.94.145.0/24'),   # GreyNoise scanners
+    ipaddress.ip_network('167.94.146.0/24'),   # GreyNoise scanners
+]
+
+# IPs individuais conhecidos como maliciosos (C2, botnets, etc.)
+SUSPICIOUS_INDIVIDUAL_IPS = {
+    '185.220.101.1':  'Tor exit node conhecido',
+    '185.220.101.2':  'Tor exit node conhecido',
+    '80.82.77.33':    'Shodan scanner (Shodan.io)',
+    '80.82.77.139':   'Shodan scanner (Shodan.io)',
+    '198.20.69.74':   'Shodan scanner (Shodan.io)',
+    '66.240.236.119': 'Censys scanner',
+    '162.142.125.0':  'GreyNoise scanner',
+}
+
+# Ranges privados/reservados — tráfego interno, não é externo
+PRIVATE_RANGES = [
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    ipaddress.ip_network('127.0.0.0/8'),
+    ipaddress.ip_network('169.254.0.0/16'),  # link-local
+    ipaddress.ip_network('224.0.0.0/4'),     # multicast
+    ipaddress.ip_network('240.0.0.0/4'),     # reservado
+    ipaddress.ip_network('::1/128'),         # IPv6 loopback
+    ipaddress.ip_network('fe80::/10'),       # IPv6 link-local
+    ipaddress.ip_network('fc00::/7'),        # IPv6 ULA
+]
+
+
+def is_private_ip(ip_str):
+    """Verifica se um IP pertence a ranges privados/reservados."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return any(ip in network for network in PRIVATE_RANGES)
+    except ValueError:
+        return True  # se não for um IP válido, ignora
+
+
+def check_suspicious_ip(ip_str):
+    """
+    Verifica se um IP externo é suspeito.
+    Retorna (True, motivo) ou (False, None).
+    """
+    if ip_str in SUSPICIOUS_INDIVIDUAL_IPS:
+        return True, SUSPICIOUS_INDIVIDUAL_IPS[ip_str]
+
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        for network in SUSPICIOUS_IP_RANGES:
+            if ip in network:
+                return True, f"IP no range suspeito {network}"
+    except ValueError:
+        pass
+
+    return False, None
+
+
+def analyze_external_traffic(packets, devices=None):
+    """
+    Analisa pacotes à procura de comunicações com IPs externos.
+    Devolve:
+      - external_df: todos os IPs externos contactados, com contagem
+      - suspicious_external: apenas os suspeitos com motivo
+    """
+    if not packets:
+        return pd.DataFrame(), {}
+
+    # Mapa de IP → nome do dispositivo local
+    local_device_names = {}
+    if devices:
+        for device in devices:
+            ip = device.get('ip')
+            name = device.get('name', 'Unknown')
+            vendor = device.get('vendor', 'Unknown')
+            if ip and ip != 'Unknown':
+                label = name if name != 'Unknown' else ip
+                if vendor and vendor != 'Unknown':
+                    label = f"{label} ({vendor})"
+                local_device_names[ip] = label
+
+    external_contacts = []   # lista de dicts com src, dst, proto, count
+    suspicious_external = {} # dst_ip → {'motivo': ..., 'dispositivos': set()}
+
+    df = pd.DataFrame(packets)
+    if df.empty or 'dst' not in df.columns:
+        return pd.DataFrame(), {}
+
+    # Filtra apenas pacotes com destino externo válido
+    df = df[df['dst'].notna() & (df['dst'] != 'Unknown')]
+
+    for _, row in df.iterrows():
+        dst = row.get('dst', '')
+        src = row.get('src', '')
+        proto = row.get('proto', 'Unknown')
+
+        if not dst or is_private_ip(dst):
+            continue  # ignora tráfego interno
+
+        is_susp, motivo = check_suspicious_ip(dst)
+        src_label = local_device_names.get(src, src)
+
+        external_contacts.append({
+            'dispositivo_origem': src_label,
+            'ip_externo': dst,
+            'protocolo': proto,
+            'suspeito': '⚠️ Sim' if is_susp else 'Não',
+            'motivo': motivo or '—'
+        })
+
+        if is_susp:
+            if dst not in suspicious_external:
+                suspicious_external[dst] = {'motivo': motivo, 'dispositivos': set()}
+            suspicious_external[dst]['dispositivos'].add(src_label)
+
+    if not external_contacts:
+        return pd.DataFrame(), {}
+
+    external_df = (
+        pd.DataFrame(external_contacts)
+        .groupby(['dispositivo_origem', 'ip_externo', 'protocolo', 'suspeito', 'motivo'])
+        .size()
+        .reset_index(name='pacotes')
+        .sort_values(['suspeito', 'pacotes'], ascending=[True, False])
+    )
+
+    return external_df, suspicious_external
 
 
 def get_tshark_path():
@@ -875,6 +1026,10 @@ if 'suspicious' not in st.session_state:
     st.session_state.suspicious = {}
 if 'last_capture_at' not in st.session_state:
     st.session_state.last_capture_at = None
+if 'external_df' not in st.session_state:
+    st.session_state.external_df = pd.DataFrame()
+if 'suspicious_external' not in st.session_state:
+    st.session_state.suspicious_external = {}
 
 st.sidebar.info(f"Interface selecionada: {selected_interface_label}")
 st.sidebar.warning("⚠️ Importante: Execute como Administrador para capturar tráfego!")
@@ -901,7 +1056,7 @@ if st.button("Descobrir Dispositivos"):
         st.session_state.devices = devices
         st.success(f"Detetados {len(devices)} dispositivos")
         df_devices = pd.DataFrame(devices)
-        st.dataframe(df_devices)
+        st.dataframe(df_devices, use_container_width=True, height=400)
 
 # --- Captura de Tráfego ---
 st.header("Análise de Tráfego")
@@ -915,6 +1070,9 @@ if st.button("Capturar Tráfego"):
         traffic_by_ip, suspicious = analyze_traffic(packets, st.session_state.devices)
         st.session_state.traffic_by_ip = traffic_by_ip
         st.session_state.suspicious = suspicious
+        external_df, suspicious_external = analyze_external_traffic(packets, st.session_state.devices)
+        st.session_state.external_df = external_df
+        st.session_state.suspicious_external = suspicious_external
 
 # --- Resultados ---
 st.header("Resultados")
@@ -928,7 +1086,7 @@ else:
 if st.session_state.packets:
     st.subheader("Pacotes Capturados (amostra)")
     preview_df = pd.DataFrame(st.session_state.packets).head(20)
-    st.dataframe(preview_df)
+    st.dataframe(preview_df, use_container_width=True, height=400)
 elif st.session_state.last_capture_at:
     st.info("Captura concluída, mas sem pacotes válidos para mostrar na amostra.")
 
@@ -936,8 +1094,8 @@ if st.session_state.last_capture_at:
     st.subheader("Tráfego por Dispositivo")
     if not st.session_state.traffic_by_ip.empty:
         traffic_plot_df = st.session_state.traffic_by_ip.sort_values('packets', ascending=False)
-        fig_height = max(4, min(14, len(traffic_plot_df) * 0.35))
-        fig, ax = plt.subplots(figsize=(12, fig_height))
+        fig_height = max(6, min(30, len(traffic_plot_df) * 0.55))
+        fig, ax = plt.subplots(figsize=(16, fig_height))
         chart_labels = traffic_plot_df['source'] if 'source' in traffic_plot_df.columns else traffic_plot_df['src']
         ax.barh(chart_labels.astype(str), traffic_plot_df['packets'])
         ax.invert_yaxis()
@@ -955,6 +1113,40 @@ if st.session_state.last_capture_at:
     else:
         st.info("Nenhum alerta detetado.")
 
+    # --- Comunicações com IPs Externos ---
+    st.subheader("Comunicações com IPs Externos")
+
+    if not st.session_state.external_df.empty:
+        # Alertas de IPs suspeitos no topo
+        if st.session_state.suspicious_external:
+            st.error(f"🚨 {len(st.session_state.suspicious_external)} IP(s) suspeito(s) detetado(s)!")
+            for dst_ip, info in st.session_state.suspicious_external.items():
+                dispositivos = ', '.join(info['dispositivos'])
+                st.warning(
+                    f"**{dst_ip}** — {info['motivo']}\n\n"
+                    f"Dispositivo(s) envolvido(s): {dispositivos}"
+                )
+        else:
+            st.success("✅ Nenhum IP externo suspeito detetado.")
+
+        # Tabela completa de comunicações externas
+        st.markdown("**Todas as comunicações com IPs externos:**")
+        st.dataframe(
+            st.session_state.external_df,
+            use_container_width=True,
+            height=400,
+            column_config={
+                'dispositivo_origem': st.column_config.TextColumn('Dispositivo Origem'),
+                'ip_externo':         st.column_config.TextColumn('IP Externo'),
+                'protocolo':          st.column_config.TextColumn('Protocolo'),
+                'pacotes':            st.column_config.NumberColumn('Pacotes'),
+                'suspeito':           st.column_config.TextColumn('Suspeito?'),
+                'motivo':             st.column_config.TextColumn('Motivo'),
+            }
+        )
+    elif st.session_state.last_capture_at:
+        st.info("Nenhuma comunicação com IPs externos detetada.")
+
 # --- Monitorização Contínua ---
 if st.checkbox("Monitorização Manual (atualiza por pedido)"):
     st.info("Clique no botão abaixo para capturar e atualizar os resultados.")
@@ -965,5 +1157,8 @@ if st.checkbox("Monitorização Manual (atualiza por pedido)"):
         traffic_by_ip, suspicious = analyze_traffic(packets, st.session_state.devices)
         st.session_state.traffic_by_ip = traffic_by_ip
         st.session_state.suspicious = suspicious
+        external_df, suspicious_external = analyze_external_traffic(packets, st.session_state.devices)
+        st.session_state.external_df = external_df
+        st.session_state.suspicious_external = suspicious_external
         st.success(f"Capturados {len(packets)} pacotes")
         st.rerun()
