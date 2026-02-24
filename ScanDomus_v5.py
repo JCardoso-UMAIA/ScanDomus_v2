@@ -1175,7 +1175,7 @@ if st.button("Descobrir Dispositivos"):
         st.session_state.devices = devices
         st.success(f"Detetados {len(devices)} dispositivos")
         df_devices = pd.DataFrame(devices)
-        st.dataframe(df_devices, use_container_width=True, height=400)
+        st.dataframe(df_devices, width='stretch', height=400)
 
 # --- Captura de Tráfego ---
 st.header("Análise de Tráfego")
@@ -1205,7 +1205,7 @@ else:
 if st.session_state.packets:
     st.subheader("Pacotes Capturados (amostra)")
     preview_df = pd.DataFrame(st.session_state.packets).head(20)
-    st.dataframe(preview_df, use_container_width=True, height=400)
+    st.dataframe(preview_df, width='stretch', height=400)
 elif st.session_state.last_capture_at:
     st.info("Captura concluída, mas sem pacotes válidos para mostrar na amostra.")
 
@@ -1252,7 +1252,7 @@ if st.session_state.last_capture_at:
         st.markdown("**Todas as comunicações com IPs externos:**")
         st.dataframe(
             st.session_state.external_df,
-            use_container_width=True,
+            width='stretch',
             height=400,
             column_config={
                 'dispositivo_origem': st.column_config.TextColumn('Dispositivo Origem'),

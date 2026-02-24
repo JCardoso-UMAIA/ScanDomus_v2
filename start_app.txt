@@ -1,0 +1,20 @@
+no ficheiro python
+# --- Configurações ---
+NETWORK_RANGE = '192.168.1.0/24'  # Ajusta conforme a tua rede
+
+
+pip show streamlit
+pip install streamlit
+
+python --version
+pip --version
+
+arrancar app
+python -m streamlit run ScanDomus_v3.py
+
+
+apagar cache
+python -m streamlit cache clear
+
+upgrade streamlight
+pip install --upgrade streamlit
